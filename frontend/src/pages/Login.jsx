@@ -1,4 +1,3 @@
-
 import React, { useState } from 'react';
 import WebcamCapture from '../components/WebcamCapture';
 import API from '../services/api';
@@ -7,9 +6,16 @@ export default function Login() {
   const [msg, setMsg] = useState('');
   const [user, setUser] = useState(null);
 
-  const handleCapture = async (imageSrc) => {
+  // Receive a File from WebcamCapture
+  const handleCapture = async (file) => {
     try {
-      const { data } = await API.post('/api/auth/login/face', { image: imageSrc });
+      const formData = new FormData();
+      formData.append('image', file); // must match backend field name
+
+      const { data } = await API.post('/api/auth/login/face', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+
       if (data?.matched) {
         setUser(data.user);
         setMsg('Login success!');
@@ -17,6 +23,7 @@ export default function Login() {
         setMsg('Face authentication failed.');
       }
     } catch (err) {
+      console.error('Face login error:', err?.response?.data || err.message);
       setMsg(err?.response?.data?.message || 'Login failed');
     }
   };

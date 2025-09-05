@@ -1,11 +1,10 @@
-
 import express from 'express';
 import dotenv from 'dotenv';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { connectDB } from './config/db.js';
+import connectDB from './config/db.js';  // Correct import for default export
 import authRoutes from './routes/auth.js';
 
 dotenv.config();
@@ -29,7 +28,7 @@ app.use('/api/auth', authRoutes);
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 const start = async () => {
-  await connectDB(process.env.MONGO_URI);
+  await connectDB();  // Call the default exported function without passing the URI
   app.listen(PORT, () => console.log(`Backend listening on http://localhost:${PORT}`));
 };
 

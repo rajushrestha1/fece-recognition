@@ -1,12 +1,20 @@
-
 import mongoose from 'mongoose';
 
-export const connectDB = async (mongoUri) => {
+const connectDB = async () => {
   try {
-    await mongoose.connect(mongoUri);
-    console.log('MongoDB connected');
+    console.log('Connecting to MongoDB with URI:', process.env.MONGO_URI);
+    await mongoose.connect(process.env.MONGO_URI, {
+      // Add your connection options here if any
+    });
+    console.log('MongoDB Connected');
   } catch (err) {
-    console.error('MongoDB connection error:', err.message);
+    console.error('MongoDB Connection Error:', err.message);
     process.exit(1);
   }
 };
+
+mongoose.connection.on('error', err => {
+  console.error('MongoDB connection error:', err);
+});
+
+export default connectDB; // Use export default

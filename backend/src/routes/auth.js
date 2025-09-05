@@ -1,4 +1,4 @@
-
+// backend/src/routes/auth.js
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
@@ -10,113 +10,169 @@ import { pyEncode, pyIdentify } from '../utils/callPython.js';
 
 const router = express.Router();
 
-// Multer storage (disk)
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    const dir = path.join(process.cwd(), 'backend', 'uploads');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: function (req, file, cb) {
-    const ext = path.extname(file.originalname);
-    const base = path.basename(file.originalname, ext).replace(/\s+/g, '_');
-    const unique = Date.now() + '_' + Math.round(Math.random()*1e9);
-    cb(null, `${base}_${unique}${ext}`);
-  }
-});
-const upload = multer({
-  storage,
-  limits: { files: 4, fileSize: 5 * 1024 * 1024 }, // 5MB each
-  fileFilter: (req, file, cb) => {
-    const allowed = ['.jpg', '.jpeg', '.png'];
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (!allowed.includes(ext)) return cb(new Error('Only .jpg/.jpeg/.png allowed'));
-    cb(null, true);
+/** Ensure uploads directory exists */
+const uploadsDir = path.join(process.cwd(), 'backend', 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+/** Disk storage for registration uploads */
+const diskStorage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadsDir),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname || '') || '.jpg';
+    const safeBase = (file.originalname || 'image')
+      .replace(/\s+/g, '_')
+      .replace(/[^\w\-\.]/g, '');
+    cb(null, `${Date.now()}_${safeBase}${ext}`);
   }
 });
 
+function fileFilter(req, file, cb) {
+  if (/^image\//.test(file.mimetype)) return cb(null, true);
+  cb(new Error('Only image files are allowed'));
+}
+
+const upload = multer({
+  storage: diskStorage,
+  fileFilter,
+  limits: { fileSize: 10 * 1024 * 1024, files: 4 }
+});
+
+/** Memory storage for face-login */
+const memoryStorage = multer.memoryStorage();
+const memoryUpload = multer({ storage: memoryStorage });
+
+/** Helper: sign JWT */
+function signToken(userId) {
+  const secret = process.env.JWT_SECRET || 'devsecret';
+  return jwt.sign({ userId }, secret, { expiresIn: '7d' });
+}
+
+/** REGISTER */
 router.post('/register', upload.array('images', 4), async (req, res) => {
   try {
     const { name, email, password } = req.body;
-    if (!name || !email || !password) {
-      return res.status(400).json({ message: 'Missing fields' });
-    }
+    if (!name || !email || !password) return res.status(400).json({ message: 'Name, email, and password are required' });
+    if (!req.files || req.files.length === 0) return res.status(400).json({ message: 'Please upload at least one face image' });
+
     const exists = await User.findOne({ email });
-    if (exists) return res.status(400).json({ message: 'Email already used' });
+    if (exists) return res.status(409).json({ message: 'Email already in use' });
 
-    const files = req.files || [];
-    if (files.length === 0) {
-      return res.status(400).json({ message: 'Please upload at least 1 image' });
+    const absPaths = req.files.map(f => path.resolve(f.path));
+
+    let encResp;
+    try {
+      encResp = await pyEncode(absPaths); // send files to Python
+    } catch (e) {
+      console.error('pyEncode error:', e?.response?.data || e.message);
+      return res.status(500).json({ message: 'Face encoding service error. Is face-service running?' });
     }
 
-    const images = files.map(f => path.join('uploads', path.basename(f.path)));
-    // Compute encodings (Python)
-    const absPaths = files.map(f => path.resolve(f.path));
-    const encResp = await pyEncode(absPaths);
-    const encodings = encResp?.encodings || [];
-
+    const encodings = (encResp?.encodings || []).filter(arr => Array.isArray(arr) && arr.length > 0);
     if (encodings.length === 0) {
-      return res.status(400).json({ message: 'No faces found in uploaded images' });
+      for (const p of absPaths) { try { fs.unlinkSync(p); } catch {} }
+      return res.status(422).json({ message: 'No faces detected in the uploaded image(s). Try clearer, front-facing photos.' });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const user = await User.create({ name, email, passwordHash, images, encodings });
-
-    return res.json({ message: 'Registered', user: { id: user._id, name: user.name, email: user.email } });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ message: 'Registration failed', error: err.message });
-  }
-});
-
-router.post('/login/face', async (req, res) => {
-  try {
-    const { image } = req.body; // data URL base64 from react-webcam
-    if (!image) return res.status(400).json({ message: 'Missing image' });
-
-    // Fetch known users + encodings
-    const users = await User.find({ encodings: { $exists: true, $ne: [] } }, { encodings: 1 }).lean();
-    if (users.length === 0) return res.status(400).json({ message: 'No users to match against' });
-
-    const payloadUsers = users.map(u => ({
-      userId: u._id.toString(),
-      encodings: u.encodings
-    }));
-
-    const { matched, userId, distance } = await pyIdentify(image, payloadUsers, 0.5);
-
-    if (!matched) {
-      return res.status(401).json({ message: 'Face authentication failed', matched: false });
-    }
-
-    // Create JWT
-    const token = jwt.sign({ userId }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.cookie('token', token, {
-      httpOnly: true,
-      sameSite: 'lax',
-      secure: (process.env.COOKIE_SECURE === 'true'),
-      maxAge: 7 * 24 * 60 * 60 * 1000
+    const stored = await User.create({
+      name,
+      email,
+      passwordHash,
+      images: absPaths.map(p => path.relative(process.cwd(), p)),
+      encodings
     });
 
-    const user = await User.findById(userId).select('name email images');
-    return res.json({ message: 'Login success', matched: true, distance, user });
+    const token = signToken(stored._id.toString());
+
+    return res
+      .cookie('token', token, { httpOnly: true, sameSite: 'lax', maxAge: 7 * 24 * 3600 * 1000 })
+      .json({ message: 'Registered successfully', user: { id: stored._id, name: stored.name, email: stored.email } });
+
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ message: 'Login failed', error: err.message });
+    console.error('Register error:', err);
+    return res.status(500).json({ message: 'Registration failed while importing image', error: err?.message });
   }
 });
 
+/** LOGIN (email/password) */
+router.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    const user = await User.findOne({ email });
+    if (!user) return res.status(401).json({ message: 'Invalid credentials' });
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) return res.status(401).json({ message: 'Invalid credentials' });
+    const token = signToken(user._id.toString());
+    return res
+      .cookie('token', token, { httpOnly: true, sameSite: 'lax', maxAge: 7 * 24 * 3600 * 1000 })
+      .json({ message: 'Logged in', user: { id: user._id, name: user.name, email: user.email } });
+  } catch (e) {
+    console.error('Login error:', e);
+    return res.status(500).json({ message: 'Login failed' });
+  }
+});
+
+/** FACE LOGIN */
+router.post('/login/face', memoryUpload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: 'No face image uploaded' });
+
+    const users = await User.find({}, { encodings: 1, _id: 1 }).lean();
+
+    const payload = users
+      .filter(u => u._id && Array.isArray(u.encodings))
+      .map(u => ({ userId: u._id.toString(), encodings: u.encodings }));
+
+    const image_base64 = `data:image/jpeg;base64,${req.file.buffer.toString('base64')}`;
+
+    let result;
+    try {
+      result = await pyIdentify(image_base64, payload, 0.5);
+      console.log('pyIdentify result:', result);
+    } catch (err) {
+      console.error('pyIdentify call failed:', err?.response?.data || err.message);
+      return res.status(500).json({ message: 'Face identify service error', error: err.message });
+    }
+
+    if (!result || !result.matched || !result.userId) {
+      return res.status(401).json({ message: 'No face match detected' });
+    }
+
+    const token = signToken(result.userId);
+    const user = await User.findById(result.userId).select('name email images');
+
+    return res
+      .cookie('token', token, { httpOnly: true, sameSite: 'lax', maxAge: 7*24*3600*1000 })
+      .json({ message: 'Logged in by face', user, distance: result.distance, matched: true });
+
+  } catch (err) {
+    console.error('Face login error:', err);
+    return res.status(500).json({ message: 'Face login failed', error: err.message });
+  }
+});
+
+/** Get current user */
 router.get('/me', async (req, res) => {
   try {
     const token = req.cookies?.token;
     if (!token) return res.status(401).json({ message: 'Not authenticated' });
-    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString('utf8'));
+    const secret = process.env.JWT_SECRET || 'devsecret';
+    const payload = jwt.verify(token, secret);
     const user = await User.findById(payload.userId).select('name email images');
     if (!user) return res.status(401).json({ message: 'User not found' });
     return res.json({ user });
   } catch (err) {
     return res.status(401).json({ message: 'Invalid session' });
   }
+});
+
+/** Multer error handler */
+router.use((err, req, res, next) => {
+  if (err && err.name === 'MulterError') return res.status(400).json({ message: `Upload error: ${err.message}` });
+  if (err && /Only image files are allowed/i.test(err.message)) return res.status(400).json({ message: err.message });
+  next(err);
 });
 
 export default router;
